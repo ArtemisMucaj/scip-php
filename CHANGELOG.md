@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/ArtemisMucaj/scip-php/compare/v0.1.0...v0.1.1) (2026-02-26)
+
+
+### Bug Fixes
+
+* correct package name in release workflow from codesearch to scip-php ([#2](https://github.com/ArtemisMucaj/scip-php/issues/2)) ([a03d890](https://github.com/ArtemisMucaj/scip-php/commit/a03d890e349c92a6116fce2873a80a5b25260724))
+
 ## 0.1.0 (2026-02-26)
 
 
