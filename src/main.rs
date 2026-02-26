@@ -8,7 +8,7 @@ use scip_php::indexer::Indexer;
 use scip_php::project::PhpProject;
 
 #[derive(Parser, Debug)]
-#[command(name = "scip-php", about = "SCIP indexer for PHP")]
+#[command(name = "scip-php", about = "SCIP indexer for PHP", version)]
 struct Args {
     /// Path to the PHP project root (containing composer.json)
     #[arg(default_value = ".")]
