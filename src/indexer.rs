@@ -1,3 +1,6 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use mago_span::HasSpan;
 use protobuf::MessageField;
@@ -12,11 +15,17 @@ use crate::symbol::{format_symbol, SymbolBuilder};
 /// SCIP indexer for PHP projects.
 pub struct Indexer {
     project: PhpProject,
+    /// Maps variable names (e.g. "$user") to their resolved class FQN (e.g. "App\\Models\\User").
+    /// Populated from parameter type hints before walking method/function bodies, cleared after.
+    var_types: RefCell<HashMap<String, String>>,
 }
 
 impl Indexer {
     pub fn new(project: PhpProject) -> Self {
-        Indexer { project }
+        Indexer {
+            project,
+            var_types: RefCell::new(HashMap::new()),
+        }
     }
 
     /// Run the indexer and produce a SCIP Index.
@@ -109,6 +118,7 @@ impl Indexer {
             &mut occurrences,
             &mut symbols,
             &mut local_counter,
+            None,
         );
 
         if occurrences.is_empty() && symbols.is_empty() {
@@ -137,6 +147,7 @@ impl Indexer {
         occurrences: &mut Vec<Occurrence>,
         symbols: &mut Vec<SymbolInformation>,
         local_counter: &mut usize,
+        enclosing_class_fqn: Option<&str>,
     ) {
         use mago_syntax::ast::Statement;
 
@@ -249,6 +260,7 @@ impl Indexer {
                         line_index,
                         occurrences,
                         local_counter,
+                        enclosing_class_fqn,
                     );
                 }
                 Statement::Return(ret) => {
@@ -260,6 +272,7 @@ impl Indexer {
                             line_index,
                             occurrences,
                             local_counter,
+                            enclosing_class_fqn,
                         );
                     }
                 }
@@ -271,6 +284,7 @@ impl Indexer {
                         line_index,
                         occurrences,
                         local_counter,
+                        enclosing_class_fqn,
                     );
                     self.walk_statement_slice(
                         if_stmt.body.statements(),
@@ -282,6 +296,7 @@ impl Indexer {
                         occurrences,
                         symbols,
                         local_counter,
+                        enclosing_class_fqn,
                     );
                     // Walk elseif clauses
                     for (cond, stmts) in if_stmt.body.else_if_clauses() {
@@ -292,6 +307,7 @@ impl Indexer {
                             line_index,
                             occurrences,
                             local_counter,
+                            enclosing_class_fqn,
                         );
                         self.walk_statement_slice(
                             stmts,
@@ -303,6 +319,7 @@ impl Indexer {
                             occurrences,
                             symbols,
                             local_counter,
+                            enclosing_class_fqn,
                         );
                     }
                     // Walk else clause
@@ -317,6 +334,7 @@ impl Indexer {
                             occurrences,
                             symbols,
                             local_counter,
+                            enclosing_class_fqn,
                         );
                     }
                 }
@@ -328,6 +346,7 @@ impl Indexer {
                         line_index,
                         occurrences,
                         local_counter,
+                        enclosing_class_fqn,
                     );
                     self.walk_statement_slice(
                         foreach_stmt.body.statements(),
@@ -339,17 +358,226 @@ impl Indexer {
                         occurrences,
                         symbols,
                         local_counter,
+                        enclosing_class_fqn,
                     );
                 }
-                _ => {
-                    // Other statements (while, for, switch, try, etc.)
-                    // can be added incrementally
+                Statement::While(while_stmt) => {
+                    self.walk_expression(
+                        &while_stmt.condition,
+                        resolved_names,
+                        builder,
+                        line_index,
+                        occurrences,
+                        local_counter,
+                        enclosing_class_fqn,
+                    );
+                    self.walk_statement_slice(
+                        while_stmt.body.statements(),
+                        trivia,
+                        resolved_names,
+                        builder,
+                        line_index,
+                        source,
+                        occurrences,
+                        symbols,
+                        local_counter,
+                        enclosing_class_fqn,
+                    );
                 }
+                Statement::DoWhile(do_while_stmt) => {
+                    self.walk_statement_slice(
+                        std::slice::from_ref(do_while_stmt.statement),
+                        trivia,
+                        resolved_names,
+                        builder,
+                        line_index,
+                        source,
+                        occurrences,
+                        symbols,
+                        local_counter,
+                        enclosing_class_fqn,
+                    );
+                    self.walk_expression(
+                        &do_while_stmt.condition,
+                        resolved_names,
+                        builder,
+                        line_index,
+                        occurrences,
+                        local_counter,
+                        enclosing_class_fqn,
+                    );
+                }
+                Statement::For(for_stmt) => {
+                    for expr in for_stmt.initializations.iter() {
+                        self.walk_expression(
+                            expr,
+                            resolved_names,
+                            builder,
+                            line_index,
+                            occurrences,
+                            local_counter,
+                            enclosing_class_fqn,
+                        );
+                    }
+                    for expr in for_stmt.conditions.iter() {
+                        self.walk_expression(
+                            expr,
+                            resolved_names,
+                            builder,
+                            line_index,
+                            occurrences,
+                            local_counter,
+                            enclosing_class_fqn,
+                        );
+                    }
+                    for expr in for_stmt.increments.iter() {
+                        self.walk_expression(
+                            expr,
+                            resolved_names,
+                            builder,
+                            line_index,
+                            occurrences,
+                            local_counter,
+                            enclosing_class_fqn,
+                        );
+                    }
+                    self.walk_statement_slice(
+                        for_stmt.body.statements(),
+                        trivia,
+                        resolved_names,
+                        builder,
+                        line_index,
+                        source,
+                        occurrences,
+                        symbols,
+                        local_counter,
+                        enclosing_class_fqn,
+                    );
+                }
+                Statement::Try(try_stmt) => {
+                    self.walk_block_statements(
+                        &try_stmt.block,
+                        trivia,
+                        resolved_names,
+                        builder,
+                        line_index,
+                        source,
+                        occurrences,
+                        symbols,
+                        local_counter,
+                        enclosing_class_fqn,
+                    );
+                    for catch_clause in try_stmt.catch_clauses.iter() {
+                        self.walk_block_statements(
+                            &catch_clause.block,
+                            trivia,
+                            resolved_names,
+                            builder,
+                            line_index,
+                            source,
+                            occurrences,
+                            symbols,
+                            local_counter,
+                            enclosing_class_fqn,
+                        );
+                    }
+                    if let Some(ref finally_clause) = try_stmt.finally_clause {
+                        self.walk_block_statements(
+                            &finally_clause.block,
+                            trivia,
+                            resolved_names,
+                            builder,
+                            line_index,
+                            source,
+                            occurrences,
+                            symbols,
+                            local_counter,
+                            enclosing_class_fqn,
+                        );
+                    }
+                }
+                Statement::Switch(switch_stmt) => {
+                    self.walk_expression(
+                        &switch_stmt.expression,
+                        resolved_names,
+                        builder,
+                        line_index,
+                        occurrences,
+                        local_counter,
+                        enclosing_class_fqn,
+                    );
+                    for case in switch_stmt.body.cases().iter() {
+                        if let Some(expr) = case.expression() {
+                            self.walk_expression(
+                                expr,
+                                resolved_names,
+                                builder,
+                                line_index,
+                                occurrences,
+                                local_counter,
+                                enclosing_class_fqn,
+                            );
+                        }
+                        self.walk_statement_slice(
+                            case.statements(),
+                            trivia,
+                            resolved_names,
+                            builder,
+                            line_index,
+                            source,
+                            occurrences,
+                            symbols,
+                            local_counter,
+                            enclosing_class_fqn,
+                        );
+                    }
+                }
+                Statement::Block(block) => {
+                    self.walk_block_statements(
+                        block,
+                        trivia,
+                        resolved_names,
+                        builder,
+                        line_index,
+                        source,
+                        occurrences,
+                        symbols,
+                        local_counter,
+                        enclosing_class_fqn,
+                    );
+                }
+                Statement::Echo(echo_stmt) => {
+                    for expr in echo_stmt.values.iter() {
+                        self.walk_expression(
+                            expr,
+                            resolved_names,
+                            builder,
+                            line_index,
+                            occurrences,
+                            local_counter,
+                            enclosing_class_fqn,
+                        );
+                    }
+                }
+                Statement::Unset(unset_stmt) => {
+                    for expr in unset_stmt.values.iter() {
+                        self.walk_expression(
+                            expr,
+                            resolved_names,
+                            builder,
+                            line_index,
+                            occurrences,
+                            local_counter,
+                            enclosing_class_fqn,
+                        );
+                    }
+                }
+                _ => {}
             }
         }
     }
 
-    /// Walk a namespace and its body.
+    /// Walk a slice of statements (used for if/else/foreach/while/for/switch bodies).
     fn walk_statement_slice<'arena>(
         &self,
         statements: &[mago_syntax::ast::Statement<'arena>],
@@ -361,6 +589,7 @@ impl Indexer {
         occurrences: &mut Vec<Occurrence>,
         symbols: &mut Vec<SymbolInformation>,
         local_counter: &mut usize,
+        enclosing_class_fqn: Option<&str>,
     ) {
         use mago_syntax::ast::Statement;
 
@@ -473,6 +702,7 @@ impl Indexer {
                         line_index,
                         occurrences,
                         local_counter,
+                        enclosing_class_fqn,
                     );
                 }
                 Statement::Return(ret) => {
@@ -484,6 +714,7 @@ impl Indexer {
                             line_index,
                             occurrences,
                             local_counter,
+                            enclosing_class_fqn,
                         );
                     }
                 }
@@ -495,6 +726,7 @@ impl Indexer {
                         line_index,
                         occurrences,
                         local_counter,
+                        enclosing_class_fqn,
                     );
                     self.walk_statement_slice(
                         if_stmt.body.statements(),
@@ -506,6 +738,7 @@ impl Indexer {
                         occurrences,
                         symbols,
                         local_counter,
+                        enclosing_class_fqn,
                     );
                     for (cond, stmts) in if_stmt.body.else_if_clauses() {
                         self.walk_expression(
@@ -515,6 +748,7 @@ impl Indexer {
                             line_index,
                             occurrences,
                             local_counter,
+                            enclosing_class_fqn,
                         );
                         self.walk_statement_slice(
                             stmts,
@@ -526,6 +760,7 @@ impl Indexer {
                             occurrences,
                             symbols,
                             local_counter,
+                            enclosing_class_fqn,
                         );
                     }
                     if let Some(else_stmts) = if_stmt.body.else_statements() {
@@ -539,6 +774,7 @@ impl Indexer {
                             occurrences,
                             symbols,
                             local_counter,
+                            enclosing_class_fqn,
                         );
                     }
                 }
@@ -550,6 +786,7 @@ impl Indexer {
                         line_index,
                         occurrences,
                         local_counter,
+                        enclosing_class_fqn,
                     );
                     self.walk_statement_slice(
                         foreach_stmt.body.statements(),
@@ -561,7 +798,219 @@ impl Indexer {
                         occurrences,
                         symbols,
                         local_counter,
+                        enclosing_class_fqn,
                     );
+                }
+                Statement::While(while_stmt) => {
+                    self.walk_expression(
+                        &while_stmt.condition,
+                        resolved_names,
+                        builder,
+                        line_index,
+                        occurrences,
+                        local_counter,
+                        enclosing_class_fqn,
+                    );
+                    self.walk_statement_slice(
+                        while_stmt.body.statements(),
+                        trivia,
+                        resolved_names,
+                        builder,
+                        line_index,
+                        source,
+                        occurrences,
+                        symbols,
+                        local_counter,
+                        enclosing_class_fqn,
+                    );
+                }
+                Statement::DoWhile(do_while_stmt) => {
+                    self.walk_statement_slice(
+                        std::slice::from_ref(do_while_stmt.statement),
+                        trivia,
+                        resolved_names,
+                        builder,
+                        line_index,
+                        source,
+                        occurrences,
+                        symbols,
+                        local_counter,
+                        enclosing_class_fqn,
+                    );
+                    self.walk_expression(
+                        &do_while_stmt.condition,
+                        resolved_names,
+                        builder,
+                        line_index,
+                        occurrences,
+                        local_counter,
+                        enclosing_class_fqn,
+                    );
+                }
+                Statement::For(for_stmt) => {
+                    for expr in for_stmt.initializations.iter() {
+                        self.walk_expression(
+                            expr,
+                            resolved_names,
+                            builder,
+                            line_index,
+                            occurrences,
+                            local_counter,
+                            enclosing_class_fqn,
+                        );
+                    }
+                    for expr in for_stmt.conditions.iter() {
+                        self.walk_expression(
+                            expr,
+                            resolved_names,
+                            builder,
+                            line_index,
+                            occurrences,
+                            local_counter,
+                            enclosing_class_fqn,
+                        );
+                    }
+                    for expr in for_stmt.increments.iter() {
+                        self.walk_expression(
+                            expr,
+                            resolved_names,
+                            builder,
+                            line_index,
+                            occurrences,
+                            local_counter,
+                            enclosing_class_fqn,
+                        );
+                    }
+                    self.walk_statement_slice(
+                        for_stmt.body.statements(),
+                        trivia,
+                        resolved_names,
+                        builder,
+                        line_index,
+                        source,
+                        occurrences,
+                        symbols,
+                        local_counter,
+                        enclosing_class_fqn,
+                    );
+                }
+                Statement::Try(try_stmt) => {
+                    self.walk_block_statements(
+                        &try_stmt.block,
+                        trivia,
+                        resolved_names,
+                        builder,
+                        line_index,
+                        source,
+                        occurrences,
+                        symbols,
+                        local_counter,
+                        enclosing_class_fqn,
+                    );
+                    for catch_clause in try_stmt.catch_clauses.iter() {
+                        self.walk_block_statements(
+                            &catch_clause.block,
+                            trivia,
+                            resolved_names,
+                            builder,
+                            line_index,
+                            source,
+                            occurrences,
+                            symbols,
+                            local_counter,
+                            enclosing_class_fqn,
+                        );
+                    }
+                    if let Some(ref finally_clause) = try_stmt.finally_clause {
+                        self.walk_block_statements(
+                            &finally_clause.block,
+                            trivia,
+                            resolved_names,
+                            builder,
+                            line_index,
+                            source,
+                            occurrences,
+                            symbols,
+                            local_counter,
+                            enclosing_class_fqn,
+                        );
+                    }
+                }
+                Statement::Switch(switch_stmt) => {
+                    self.walk_expression(
+                        &switch_stmt.expression,
+                        resolved_names,
+                        builder,
+                        line_index,
+                        occurrences,
+                        local_counter,
+                        enclosing_class_fqn,
+                    );
+                    for case in switch_stmt.body.cases().iter() {
+                        if let Some(expr) = case.expression() {
+                            self.walk_expression(
+                                expr,
+                                resolved_names,
+                                builder,
+                                line_index,
+                                occurrences,
+                                local_counter,
+                                enclosing_class_fqn,
+                            );
+                        }
+                        self.walk_statement_slice(
+                            case.statements(),
+                            trivia,
+                            resolved_names,
+                            builder,
+                            line_index,
+                            source,
+                            occurrences,
+                            symbols,
+                            local_counter,
+                            enclosing_class_fqn,
+                        );
+                    }
+                }
+                Statement::Block(block) => {
+                    self.walk_block_statements(
+                        block,
+                        trivia,
+                        resolved_names,
+                        builder,
+                        line_index,
+                        source,
+                        occurrences,
+                        symbols,
+                        local_counter,
+                        enclosing_class_fqn,
+                    );
+                }
+                Statement::Echo(echo_stmt) => {
+                    for expr in echo_stmt.values.iter() {
+                        self.walk_expression(
+                            expr,
+                            resolved_names,
+                            builder,
+                            line_index,
+                            occurrences,
+                            local_counter,
+                            enclosing_class_fqn,
+                        );
+                    }
+                }
+                Statement::Unset(unset_stmt) => {
+                    for expr in unset_stmt.values.iter() {
+                        self.walk_expression(
+                            expr,
+                            resolved_names,
+                            builder,
+                            line_index,
+                            occurrences,
+                            local_counter,
+                            enclosing_class_fqn,
+                        );
+                    }
                 }
                 _ => {}
             }
@@ -618,6 +1067,7 @@ impl Indexer {
                     occurrences,
                     symbols,
                     local_counter,
+                    None,
                 );
             }
             NamespaceBody::BraceDelimited(block) => {
@@ -631,6 +1081,7 @@ impl Indexer {
                     occurrences,
                     symbols,
                     local_counter,
+                    None,
                 );
             }
         }
@@ -1153,6 +1604,8 @@ impl Indexer {
 
         // Walk method body for expression references
         if let mago_syntax::ast::MethodBody::Concrete(ref block) = method.body {
+            // Populate variable type map from parameter type hints
+            self.populate_var_types_from_params(&method.parameter_list, resolved_names);
             self.walk_block_statements(
                 block,
                 trivia,
@@ -1163,7 +1616,9 @@ impl Indexer {
                 occurrences,
                 symbols,
                 local_counter,
+                Some(class_fqn),
             );
+            self.var_types.borrow_mut().clear();
         }
     }
 
@@ -1247,6 +1702,7 @@ impl Indexer {
         }
 
         // Walk function body for expression references
+        self.populate_var_types_from_params(&func.parameter_list, resolved_names);
         self.walk_block_statements(
             &func.body,
             trivia,
@@ -1257,7 +1713,9 @@ impl Indexer {
             occurrences,
             symbols,
             local_counter,
+            None,
         );
+        self.var_types.borrow_mut().clear();
     }
 
     /// Walk a property definition.
@@ -1476,44 +1934,49 @@ impl Indexer {
         occurrences: &mut Vec<Occurrence>,
     ) {
         use mago_syntax::ast::UseItems;
+        use mago_syntax::ast::UseType;
 
-        // Helper closure to emit an import occurrence for a UseItem
-        let mut emit_use_item = |item: &mago_syntax::ast::UseItem<'arena>| {
-            let fqn = self
-                .resolve_identifier(&item.name, resolved_names)
-                .unwrap_or_else(|| item.name.value().to_string());
+        // Helper closure to emit an import occurrence for a UseItem.
+        // `use_type` indicates whether this is `use function`, `use const`, or plain `use`.
+        let mut emit_use_item =
+            |item: &mago_syntax::ast::UseItem<'arena>, use_type: Option<&UseType<'arena>>| {
+                let fqn = self
+                    .resolve_identifier(&item.name, resolved_names)
+                    .unwrap_or_else(|| item.name.value().to_string());
 
-            // Default use statements import classes/interfaces/traits/enums
-            let sym = builder.class_like_symbol(&fqn);
-            let span = item.name.span();
-            occurrences.push(Occurrence {
-                range: line_index.scip_range(span.start.offset, span.end.offset),
-                symbol: format_symbol(&sym),
-                symbol_roles: types::SymbolRole::Import as i32,
-                ..Default::default()
-            });
-        };
+                let sym = match use_type {
+                    Some(UseType::Function(_)) => builder.function_symbol(&fqn),
+                    Some(UseType::Const(_)) => builder.constant_symbol(&fqn),
+                    None => builder.class_like_symbol(&fqn),
+                };
+                let span = item.name.span();
+                occurrences.push(Occurrence {
+                    range: line_index.scip_range(span.start.offset, span.end.offset),
+                    symbol: format_symbol(&sym),
+                    symbol_roles: types::SymbolRole::Import as i32,
+                    ..Default::default()
+                });
+            };
 
         match &use_stmt.items {
             UseItems::Sequence(seq) => {
                 for item in seq.items.iter() {
-                    emit_use_item(item);
+                    emit_use_item(item, None);
                 }
             }
             UseItems::TypedSequence(seq) => {
                 for item in seq.items.iter() {
-                    // For `use function` or `use const`, we still emit import references
-                    emit_use_item(item);
+                    emit_use_item(item, Some(&seq.r#type));
                 }
             }
             UseItems::TypedList(list) => {
                 for item in list.items.iter() {
-                    emit_use_item(item);
+                    emit_use_item(item, Some(&list.r#type));
                 }
             }
             UseItems::MixedList(list) => {
                 for maybe_typed in list.items.iter() {
-                    emit_use_item(&maybe_typed.item);
+                    emit_use_item(&maybe_typed.item, maybe_typed.r#type.as_ref());
                 }
             }
         }
@@ -1528,6 +1991,7 @@ impl Indexer {
         line_index: &LineIndex,
         occurrences: &mut Vec<Occurrence>,
         local_counter: &mut usize,
+        enclosing_class_fqn: Option<&str>,
     ) {
         use mago_syntax::ast::Expression;
         match expr {
@@ -1540,6 +2004,7 @@ impl Indexer {
                     line_index,
                     occurrences,
                     local_counter,
+                    enclosing_class_fqn,
                 );
                 if let Some(arg_list) = &inst.argument_list {
                     for arg in arg_list.arguments.iter() {
@@ -1550,6 +2015,7 @@ impl Indexer {
                             line_index,
                             occurrences,
                             local_counter,
+                            enclosing_class_fqn,
                         );
                     }
                 }
@@ -1560,14 +2026,36 @@ impl Indexer {
                 use mago_syntax::ast::Call;
                 match call {
                     Call::Function(func_call) => {
-                        self.walk_expression(
-                            func_call.function,
-                            resolved_names,
-                            builder,
-                            line_index,
-                            occurrences,
-                            local_counter,
-                        );
+                        // If the function expression is a bare identifier, emit a
+                        // function_symbol (with `().` suffix) instead of delegating
+                        // to walk_expression which would emit class_like_symbol (`#`).
+                        if let Expression::Identifier(ident) = func_call.function {
+                            let name = ident.value();
+                            if !is_builtin_type(name) {
+                                let fqn = self
+                                    .resolve_identifier(ident, resolved_names)
+                                    .unwrap_or_else(|| name.to_string());
+                                let sym = builder.function_symbol(&fqn);
+                                let span = ident.span();
+                                occurrences.push(Occurrence {
+                                    range: line_index
+                                        .scip_range(span.start.offset, span.end.offset),
+                                    symbol: format_symbol(&sym),
+                                    ..Default::default()
+                                });
+                            }
+                        } else {
+                            // Dynamic/complex function expression (e.g. $var(), $obj->getCallable()())
+                            self.walk_expression(
+                                func_call.function,
+                                resolved_names,
+                                builder,
+                                line_index,
+                                occurrences,
+                                local_counter,
+                                enclosing_class_fqn,
+                            );
+                        }
                         for arg in func_call.argument_list.arguments.iter() {
                             self.walk_expression(
                                 arg.value(),
@@ -1576,6 +2064,7 @@ impl Indexer {
                                 line_index,
                                 occurrences,
                                 local_counter,
+                                enclosing_class_fqn,
                             );
                         }
                     }
@@ -1588,7 +2077,28 @@ impl Indexer {
                             line_index,
                             occurrences,
                             local_counter,
+                            enclosing_class_fqn,
                         );
+                        // Emit reference for the method name (e.g. ClassName::methodName())
+                        if let mago_syntax::ast::ClassLikeMemberSelector::Identifier(method_ident) =
+                            &static_call.method
+                        {
+                            if let Some(class_fqn) = self.try_resolve_class_from_expr(
+                                static_call.class,
+                                resolved_names,
+                                enclosing_class_fqn,
+                            ) {
+                                let method_name = method_ident.value;
+                                let sym = builder.method_symbol(&class_fqn, method_name);
+                                let span = method_ident.span;
+                                occurrences.push(Occurrence {
+                                    range: line_index
+                                        .scip_range(span.start.offset, span.end.offset),
+                                    symbol: format_symbol(&sym),
+                                    ..Default::default()
+                                });
+                            }
+                        }
                         for arg in static_call.argument_list.arguments.iter() {
                             self.walk_expression(
                                 arg.value(),
@@ -1597,6 +2107,7 @@ impl Indexer {
                                 line_index,
                                 occurrences,
                                 local_counter,
+                                enclosing_class_fqn,
                             );
                         }
                     }
@@ -1608,7 +2119,28 @@ impl Indexer {
                             line_index,
                             occurrences,
                             local_counter,
+                            enclosing_class_fqn,
                         );
+                        // Emit reference for the method name (e.g. $this->methodName())
+                        if let mago_syntax::ast::ClassLikeMemberSelector::Identifier(method_ident) =
+                            &method_call.method
+                        {
+                            if let Some(class_fqn) = self.try_resolve_class_from_expr(
+                                method_call.object,
+                                resolved_names,
+                                enclosing_class_fqn,
+                            ) {
+                                let method_name = method_ident.value;
+                                let sym = builder.method_symbol(&class_fqn, method_name);
+                                let span = method_ident.span;
+                                occurrences.push(Occurrence {
+                                    range: line_index
+                                        .scip_range(span.start.offset, span.end.offset),
+                                    symbol: format_symbol(&sym),
+                                    ..Default::default()
+                                });
+                            }
+                        }
                         for arg in method_call.argument_list.arguments.iter() {
                             self.walk_expression(
                                 arg.value(),
@@ -1617,6 +2149,7 @@ impl Indexer {
                                 line_index,
                                 occurrences,
                                 local_counter,
+                                enclosing_class_fqn,
                             );
                         }
                     }
@@ -1628,7 +2161,28 @@ impl Indexer {
                             line_index,
                             occurrences,
                             local_counter,
+                            enclosing_class_fqn,
                         );
+                        // Emit reference for the method name (e.g. $obj?->methodName())
+                        if let mago_syntax::ast::ClassLikeMemberSelector::Identifier(method_ident) =
+                            &method_call.method
+                        {
+                            if let Some(class_fqn) = self.try_resolve_class_from_expr(
+                                method_call.object,
+                                resolved_names,
+                                enclosing_class_fqn,
+                            ) {
+                                let method_name = method_ident.value;
+                                let sym = builder.method_symbol(&class_fqn, method_name);
+                                let span = method_ident.span;
+                                occurrences.push(Occurrence {
+                                    range: line_index
+                                        .scip_range(span.start.offset, span.end.offset),
+                                    symbol: format_symbol(&sym),
+                                    ..Default::default()
+                                });
+                            }
+                        }
                         for arg in method_call.argument_list.arguments.iter() {
                             self.walk_expression(
                                 arg.value(),
@@ -1637,6 +2191,7 @@ impl Indexer {
                                 line_index,
                                 occurrences,
                                 local_counter,
+                                enclosing_class_fqn,
                             );
                         }
                     }
@@ -1655,7 +2210,28 @@ impl Indexer {
                             line_index,
                             occurrences,
                             local_counter,
+                            enclosing_class_fqn,
                         );
+                        // Emit reference for the property name (e.g. $this->propertyName)
+                        if let mago_syntax::ast::ClassLikeMemberSelector::Identifier(prop_ident) =
+                            &prop.property
+                        {
+                            if let Some(class_fqn) = self.try_resolve_class_from_expr(
+                                prop.object,
+                                resolved_names,
+                                enclosing_class_fqn,
+                            ) {
+                                let prop_name = prop_ident.value;
+                                let sym = builder.property_symbol(&class_fqn, prop_name);
+                                let span = prop_ident.span;
+                                occurrences.push(Occurrence {
+                                    range: line_index
+                                        .scip_range(span.start.offset, span.end.offset),
+                                    symbol: format_symbol(&sym),
+                                    ..Default::default()
+                                });
+                            }
+                        }
                     }
                     Access::NullSafeProperty(prop) => {
                         self.walk_expression(
@@ -1665,7 +2241,28 @@ impl Indexer {
                             line_index,
                             occurrences,
                             local_counter,
+                            enclosing_class_fqn,
                         );
+                        // Emit reference for the property name (e.g. $obj?->propertyName)
+                        if let mago_syntax::ast::ClassLikeMemberSelector::Identifier(prop_ident) =
+                            &prop.property
+                        {
+                            if let Some(class_fqn) = self.try_resolve_class_from_expr(
+                                prop.object,
+                                resolved_names,
+                                enclosing_class_fqn,
+                            ) {
+                                let prop_name = prop_ident.value;
+                                let sym = builder.property_symbol(&class_fqn, prop_name);
+                                let span = prop_ident.span;
+                                occurrences.push(Occurrence {
+                                    range: line_index
+                                        .scip_range(span.start.offset, span.end.offset),
+                                    symbol: format_symbol(&sym),
+                                    ..Default::default()
+                                });
+                            }
+                        }
                     }
                     Access::StaticProperty(prop) => {
                         self.walk_expression(
@@ -1675,7 +2272,26 @@ impl Indexer {
                             line_index,
                             occurrences,
                             local_counter,
+                            enclosing_class_fqn,
                         );
+                        // Emit reference for the static property (e.g. ClassName::$propName)
+                        if let mago_syntax::ast::Variable::Direct(var) = &prop.property {
+                            if let Some(class_fqn) = self.try_resolve_class_from_expr(
+                                prop.class,
+                                resolved_names,
+                                enclosing_class_fqn,
+                            ) {
+                                let prop_name = var.name.strip_prefix('$').unwrap_or(var.name);
+                                let sym = builder.property_symbol(&class_fqn, prop_name);
+                                let span = var.span;
+                                occurrences.push(Occurrence {
+                                    range: line_index
+                                        .scip_range(span.start.offset, span.end.offset),
+                                    symbol: format_symbol(&sym),
+                                    ..Default::default()
+                                });
+                            }
+                        }
                     }
                     Access::ClassConstant(cc) => {
                         self.walk_expression(
@@ -1685,7 +2301,32 @@ impl Indexer {
                             line_index,
                             occurrences,
                             local_counter,
+                            enclosing_class_fqn,
                         );
+                        // Emit reference for the constant name (e.g. ClassName::CONST_NAME)
+                        if let mago_syntax::ast::ClassLikeConstantSelector::Identifier(
+                            const_ident,
+                        ) = &cc.constant
+                        {
+                            if let Some(class_fqn) = self.try_resolve_class_from_expr(
+                                cc.class,
+                                resolved_names,
+                                enclosing_class_fqn,
+                            ) {
+                                let const_name = const_ident.value;
+                                // Skip "class" pseudo-constant (ClassName::class)
+                                if const_name != "class" {
+                                    let sym = builder.class_constant_symbol(&class_fqn, const_name);
+                                    let span = const_ident.span;
+                                    occurrences.push(Occurrence {
+                                        range: line_index
+                                            .scip_range(span.start.offset, span.end.offset),
+                                        symbol: format_symbol(&sym),
+                                        ..Default::default()
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1707,8 +2348,22 @@ impl Indexer {
                 }
             }
 
-            // Assignment: walk both sides
+            // Assignment: walk both sides, and infer variable types from `new ClassName()`
             Expression::Assignment(assign) => {
+                // If LHS is a simple variable and RHS is `new ClassName(...)`, track the type
+                if let Expression::Variable(mago_syntax::ast::Variable::Direct(dv)) = assign.lhs {
+                    if let Expression::Instantiation(inst) = assign.rhs {
+                        if let Some(class_fqn) = self.try_resolve_class_from_expr(
+                            inst.class,
+                            resolved_names,
+                            enclosing_class_fqn,
+                        ) {
+                            self.var_types
+                                .borrow_mut()
+                                .insert(dv.name.to_string(), class_fqn);
+                        }
+                    }
+                }
                 self.walk_expression(
                     assign.lhs,
                     resolved_names,
@@ -1716,6 +2371,7 @@ impl Indexer {
                     line_index,
                     occurrences,
                     local_counter,
+                    enclosing_class_fqn,
                 );
                 self.walk_expression(
                     assign.rhs,
@@ -1724,6 +2380,7 @@ impl Indexer {
                     line_index,
                     occurrences,
                     local_counter,
+                    enclosing_class_fqn,
                 );
             }
 
@@ -1736,6 +2393,7 @@ impl Indexer {
                     line_index,
                     occurrences,
                     local_counter,
+                    enclosing_class_fqn,
                 );
                 self.walk_expression(
                     binary.rhs,
@@ -1744,6 +2402,7 @@ impl Indexer {
                     line_index,
                     occurrences,
                     local_counter,
+                    enclosing_class_fqn,
                 );
             }
 
@@ -1756,6 +2415,7 @@ impl Indexer {
                     line_index,
                     occurrences,
                     local_counter,
+                    enclosing_class_fqn,
                 );
             }
             Expression::UnaryPostfix(unary) => {
@@ -1766,6 +2426,7 @@ impl Indexer {
                     line_index,
                     occurrences,
                     local_counter,
+                    enclosing_class_fqn,
                 );
             }
 
@@ -1778,6 +2439,7 @@ impl Indexer {
                     line_index,
                     occurrences,
                     local_counter,
+                    enclosing_class_fqn,
                 );
             }
 
@@ -1790,6 +2452,7 @@ impl Indexer {
                     line_index,
                     occurrences,
                     local_counter,
+                    enclosing_class_fqn,
                 );
                 if let Some(then_expr) = &cond.then {
                     self.walk_expression(
@@ -1799,6 +2462,7 @@ impl Indexer {
                         line_index,
                         occurrences,
                         local_counter,
+                        enclosing_class_fqn,
                     );
                 }
                 self.walk_expression(
@@ -1808,6 +2472,7 @@ impl Indexer {
                     line_index,
                     occurrences,
                     local_counter,
+                    enclosing_class_fqn,
                 );
             }
 
@@ -1824,6 +2489,7 @@ impl Indexer {
                                 line_index,
                                 occurrences,
                                 local_counter,
+                                enclosing_class_fqn,
                             );
                             self.walk_expression(
                                 kv.value,
@@ -1832,6 +2498,7 @@ impl Indexer {
                                 line_index,
                                 occurrences,
                                 local_counter,
+                                enclosing_class_fqn,
                             );
                         }
                         ArrayElement::Value(val) => {
@@ -1842,6 +2509,7 @@ impl Indexer {
                                 line_index,
                                 occurrences,
                                 local_counter,
+                                enclosing_class_fqn,
                             );
                         }
                         ArrayElement::Variadic(var) => {
@@ -1852,6 +2520,7 @@ impl Indexer {
                                 line_index,
                                 occurrences,
                                 local_counter,
+                                enclosing_class_fqn,
                             );
                         }
                         _ => {}
@@ -1886,6 +2555,7 @@ impl Indexer {
                     line_index,
                     occurrences,
                     local_counter,
+                    enclosing_class_fqn,
                 );
             }
 
@@ -1898,6 +2568,7 @@ impl Indexer {
                     line_index,
                     occurrences,
                     local_counter,
+                    enclosing_class_fqn,
                 );
             }
 
@@ -1910,6 +2581,7 @@ impl Indexer {
                     line_index,
                     occurrences,
                     local_counter,
+                    enclosing_class_fqn,
                 );
             }
 
@@ -1922,6 +2594,7 @@ impl Indexer {
                     line_index,
                     occurrences,
                     local_counter,
+                    enclosing_class_fqn,
                 );
                 self.walk_expression(
                     access.index,
@@ -1930,6 +2603,7 @@ impl Indexer {
                     line_index,
                     occurrences,
                     local_counter,
+                    enclosing_class_fqn,
                 );
             }
 
@@ -1967,6 +2641,7 @@ impl Indexer {
         occurrences: &mut Vec<Occurrence>,
         symbols: &mut Vec<SymbolInformation>,
         local_counter: &mut usize,
+        enclosing_class_fqn: Option<&str>,
     ) {
         self.walk_statements(
             &block.statements,
@@ -1978,6 +2653,7 @@ impl Indexer {
             occurrences,
             symbols,
             local_counter,
+            enclosing_class_fqn,
         );
     }
 
@@ -2090,6 +2766,89 @@ impl Indexer {
         resolved_names: &mago_names::ResolvedNames<'_>,
     ) -> Option<String> {
         resolved_names.resolve(ident).map(|s| s.to_string())
+    }
+
+    /// Try to resolve a class FQN from an expression used as a class reference.
+    ///
+    /// Handles:
+    /// - `$this` → uses `enclosing_class_fqn`
+    /// - `self`, `static`, `parent` → uses `enclosing_class_fqn` (simplified; parent could be more precise)
+    /// - `ClassName` (Identifier) → resolves via resolved_names
+    /// - `$variable` → looks up type from parameter type hints in `var_types`
+    fn try_resolve_class_from_expr<'arena>(
+        &self,
+        expr: &mago_syntax::ast::Expression<'arena>,
+        resolved_names: &mago_names::ResolvedNames<'arena>,
+        enclosing_class_fqn: Option<&str>,
+    ) -> Option<String> {
+        use mago_syntax::ast::Expression;
+        use mago_syntax::ast::Variable;
+
+        match expr {
+            Expression::Variable(Variable::Direct(dv)) if dv.name == "$this" => {
+                enclosing_class_fqn.map(|s| s.to_string())
+            }
+            Expression::Variable(Variable::Direct(dv)) => {
+                // Look up variable type from parameter type hints
+                self.var_types.borrow().get(dv.name).cloned()
+            }
+            Expression::Identifier(ident) => {
+                let name = ident.value();
+                match name.to_lowercase().as_str() {
+                    "self" | "static" | "parent" => enclosing_class_fqn.map(|s| s.to_string()),
+                    _ => {
+                        let fqn = self
+                            .resolve_identifier(ident, resolved_names)
+                            .unwrap_or_else(|| name.to_string());
+                        Some(fqn)
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Try to extract a class FQN from a type hint.
+    /// Returns `Some(fqn)` for simple class type hints (including nullable),
+    /// `None` for union/intersection types, built-in types, etc.
+    fn resolve_hint_to_fqn<'arena>(
+        &self,
+        hint: &mago_syntax::ast::Hint<'arena>,
+        resolved_names: &mago_names::ResolvedNames<'arena>,
+    ) -> Option<String> {
+        use mago_syntax::ast::Hint;
+        match hint {
+            Hint::Identifier(ident) => {
+                let name = ident.value();
+                if is_builtin_type(name) {
+                    None
+                } else {
+                    let fqn = self
+                        .resolve_identifier(ident, resolved_names)
+                        .unwrap_or_else(|| name.to_string());
+                    Some(fqn)
+                }
+            }
+            Hint::Nullable(nullable) => self.resolve_hint_to_fqn(&nullable.hint, resolved_names),
+            // Union/intersection types are ambiguous — don't resolve
+            _ => None,
+        }
+    }
+
+    /// Populate `var_types` from parameter type hints of a function-like parameter list.
+    fn populate_var_types_from_params<'arena>(
+        &self,
+        params: &mago_syntax::ast::FunctionLikeParameterList<'arena>,
+        resolved_names: &mago_names::ResolvedNames<'arena>,
+    ) {
+        let mut var_types = self.var_types.borrow_mut();
+        for param in params.parameters.iter() {
+            if let Some(hint) = &param.hint {
+                if let Some(fqn) = self.resolve_hint_to_fqn(hint, resolved_names) {
+                    var_types.insert(param.variable.name.to_string(), fqn);
+                }
+            }
+        }
     }
 }
 

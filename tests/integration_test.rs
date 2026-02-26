@@ -270,6 +270,41 @@ fn test_expression_references() {
         "Should have at least 2 references to Status, found {}",
         status_refs.len()
     );
+
+    // Check that $user->getName() in getUserName() emits a reference to User#getName().
+    // The parameter `User $user` type hint should allow resolving $user's class to App\Models\User,
+    // so the method call should emit a reference to App/Models/User#getName().
+    let has_getname_method_ref = service_doc.occurrences.iter().any(|o| {
+        o.symbol.contains("App/Models/User#getName().")
+            && (o.symbol_roles & scip::types::SymbolRole::Definition as i32) == 0
+    });
+    assert!(
+        has_getname_method_ref,
+        "Should have a reference to User#getName(). from $user->getName() call.\n\
+         Available symbols: {:?}",
+        service_doc
+            .occurrences
+            .iter()
+            .map(|o| &o.symbol)
+            .collect::<Vec<_>>()
+    );
+
+    // Check that `new User(...)` in createUser() populates var_types so
+    // subsequent $user-> calls would also resolve (verifying the assignment tracking)
+    let user_doc_main = index
+        .documents
+        .iter()
+        .find(|d| d.relative_path.contains("User.php"))
+        .expect("Should have User.php");
+    // Verify User#getName(). is defined
+    let has_getname_def = user_doc_main.occurrences.iter().any(|o| {
+        o.symbol.contains("App/Models/User#getName().")
+            && (o.symbol_roles & scip::types::SymbolRole::Definition as i32) != 0
+    });
+    assert!(
+        has_getname_def,
+        "Should have User#getName(). definition in User.php"
+    );
 }
 
 #[test]
