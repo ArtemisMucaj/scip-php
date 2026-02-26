@@ -34,14 +34,14 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            artifact_name: codesearch
-            asset_name: codesearch-linux-x86_64
+            artifact_name: scip-php
+            asset_name: scip-php-linux-x86_64
           - os: macos-14
-            artifact_name: codesearch
-            asset_name: codesearch-macos-aarch64
+            artifact_name: scip-php
+            asset_name: scip-php-macos-aarch64
           - os: windows-latest
-            artifact_name: codesearch.exe
-            asset_name: codesearch-windows-x86_64.exe
+            artifact_name: scip-php.exe
+            asset_name: scip-php-windows-x86_64.exe
 
     steps:
       - name: Checkout code
