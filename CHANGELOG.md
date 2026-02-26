@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/ArtemisMucaj/scip-php/compare/v0.1.1...v0.1.2) (2026-02-26)
+
+
+### Bug Fixes
+
+* add --version flag to CLI ([#5](https://github.com/ArtemisMucaj/scip-php/issues/5)) ([3b037bb](https://github.com/ArtemisMucaj/scip-php/commit/3b037bb81c9a7fb5f5720dead9025113dbb021cc))
+
 ## [0.1.1](https://github.com/ArtemisMucaj/scip-php/compare/v0.1.0...v0.1.1) (2026-02-26)
 
 
