@@ -97,6 +97,7 @@ impl<'a> SymbolBuilder<'a> {
         }
     }
 
+    #[allow(dead_code)]
     fn type_parameter_descriptor(name: &str) -> Descriptor {
         Descriptor {
             name: name.to_string(),
