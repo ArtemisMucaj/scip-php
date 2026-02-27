@@ -270,6 +270,43 @@ fn test_expression_references() {
         "Should have at least 2 references to Status, found {}",
         status_refs.len()
     );
+
+    // Check that $user->getName() in getUserName() emits a reference to User#getName().
+    // The parameter `User $user` type hint should allow resolving $user's class to App\Models\User,
+    // so the method call should emit a reference to App/Models/User#getName().
+    let has_getname_method_ref = service_doc.occurrences.iter().any(|o| {
+        o.symbol.contains("App/Models/User#getName().")
+            && (o.symbol_roles & scip::types::SymbolRole::Definition as i32) == 0
+    });
+    assert!(
+        has_getname_method_ref,
+        "Should have a reference to User#getName(). from $user->getName() call.\n\
+         Available symbols: {:?}",
+        service_doc
+            .occurrences
+            .iter()
+            .map(|o| &o.symbol)
+            .collect::<Vec<_>>()
+    );
+
+    // Verify assignment-based var_types propagation: `$user = new User(...)` in createUser()
+    // should allow `$user->getName()` (on the next line) to resolve via var_types, producing
+    // a second reference to App/Models/User#getName(). alongside the one from getUserName().
+    let getname_ref_count = service_doc
+        .occurrences
+        .iter()
+        .filter(|o| {
+            o.symbol.contains("App/Models/User#getName().")
+                && (o.symbol_roles & scip::types::SymbolRole::Definition as i32) == 0
+        })
+        .count();
+    assert!(
+        getname_ref_count >= 2,
+        "Should have at least 2 references to User#getName(). \
+         (one from type-hint param in getUserName, one from assignment-based var_types in createUser), \
+         found {}",
+        getname_ref_count
+    );
 }
 
 #[test]
