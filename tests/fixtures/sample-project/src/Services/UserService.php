@@ -10,6 +10,7 @@ class UserService
     public function createUser(string $name, int $age): User
     {
         $user = new User($name, $age);
+        $user->getName();
         return $user;
     }
 

@@ -289,21 +289,23 @@ fn test_expression_references() {
             .collect::<Vec<_>>()
     );
 
-    // Check that `new User(...)` in createUser() populates var_types so
-    // subsequent $user-> calls would also resolve (verifying the assignment tracking)
-    let user_doc_main = index
-        .documents
+    // Verify assignment-based var_types propagation: `$user = new User(...)` in createUser()
+    // should allow `$user->getName()` (on the next line) to resolve via var_types, producing
+    // a second reference to App/Models/User#getName(). alongside the one from getUserName().
+    let getname_ref_count = service_doc
+        .occurrences
         .iter()
-        .find(|d| d.relative_path.contains("User.php"))
-        .expect("Should have User.php");
-    // Verify User#getName(). is defined
-    let has_getname_def = user_doc_main.occurrences.iter().any(|o| {
-        o.symbol.contains("App/Models/User#getName().")
-            && (o.symbol_roles & scip::types::SymbolRole::Definition as i32) != 0
-    });
+        .filter(|o| {
+            o.symbol.contains("App/Models/User#getName().")
+                && (o.symbol_roles & scip::types::SymbolRole::Definition as i32) == 0
+        })
+        .count();
     assert!(
-        has_getname_def,
-        "Should have User#getName(). definition in User.php"
+        getname_ref_count >= 2,
+        "Should have at least 2 references to User#getName(). \
+         (one from type-hint param in getUserName, one from assignment-based var_types in createUser), \
+         found {}",
+        getname_ref_count
     );
 }
 

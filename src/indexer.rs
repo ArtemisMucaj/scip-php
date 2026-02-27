@@ -2772,7 +2772,8 @@ impl Indexer {
     ///
     /// Handles:
     /// - `$this` → uses `enclosing_class_fqn`
-    /// - `self`, `static`, `parent` → uses `enclosing_class_fqn` (simplified; parent could be more precise)
+    /// - `self`, `static` → uses `enclosing_class_fqn`
+    /// - `parent` → returns `None` (parent FQN resolution not yet implemented)
     /// - `ClassName` (Identifier) → resolves via resolved_names
     /// - `$variable` → looks up type from parameter type hints in `var_types`
     fn try_resolve_class_from_expr<'arena>(
@@ -2795,7 +2796,8 @@ impl Indexer {
             Expression::Identifier(ident) => {
                 let name = ident.value();
                 match name.to_lowercase().as_str() {
-                    "self" | "static" | "parent" => enclosing_class_fqn.map(|s| s.to_string()),
+                    "self" | "static" => enclosing_class_fqn.map(|s| s.to_string()),
+                    "parent" => None,
                     _ => {
                         let fqn = self
                             .resolve_identifier(ident, resolved_names)
