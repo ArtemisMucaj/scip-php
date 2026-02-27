@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/ArtemisMucaj/scip-php/compare/v0.1.2...v0.2.0) (2026-02-27)
+
+
+### Features
+
+* add missing php parser blocks ([#7](https://github.com/ArtemisMucaj/scip-php/issues/7)) ([06f993f](https://github.com/ArtemisMucaj/scip-php/commit/06f993f15d66e56d2b49a30e60a8919ecf3faf11))
+
 ## [0.1.2](https://github.com/ArtemisMucaj/scip-php/compare/v0.1.1...v0.1.2) (2026-02-26)
 
 
