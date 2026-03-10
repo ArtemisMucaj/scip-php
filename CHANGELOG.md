@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/ArtemisMucaj/scip-php/compare/v0.2.0...v0.2.1) (2026-03-10)
+
+
+### Bug Fixes
+
+* resolve method call references ([#9](https://github.com/ArtemisMucaj/scip-php/issues/9)) ([e1843f7](https://github.com/ArtemisMucaj/scip-php/commit/e1843f751a877d65af96027ecd2ce1249e58acb8))
+
 ## [0.2.0](https://github.com/ArtemisMucaj/scip-php/compare/v0.1.2...v0.2.0) (2026-02-27)
 
 
