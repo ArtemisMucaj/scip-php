@@ -310,6 +310,74 @@ fn test_expression_references() {
 }
 
 #[test]
+fn test_chained_property_access_resolution() {
+    // Verifies that when code accesses `$profile->user->getName()` where:
+    //   - `$profile` is typed as `UserProfile` (via parameter type hint)
+    //   - `UserProfile::$user` is declared as `public User $user` (typed property)
+    // scip-php emits a reference to `App/Models/User#getName().` for the method call.
+    //
+    // Before the property_types pre-pass, the indexer couldn't resolve the type of
+    // `$profile->user` and so the `->getName()` call was silently dropped.
+    let project_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample-project");
+
+    let project = PhpProject::discover(&project_root).unwrap();
+    let indexer = Indexer::new(project);
+    let index = indexer.index().unwrap();
+
+    let profile_service_doc = index
+        .documents
+        .iter()
+        .find(|d| d.relative_path.contains("ProfileService.php"))
+        .expect("Should have ProfileService.php");
+
+    // Both `$profile->user->getName()` (regular) and `$profile?->user?->getName()`
+    // (null-safe) should each emit a reference to User#getName(). — expect 2 total.
+    let chained_method_refs: Vec<_> = profile_service_doc
+        .occurrences
+        .iter()
+        .filter(|o| {
+            o.symbol.contains("App/Models/User#getName().")
+                && (o.symbol_roles & scip::types::SymbolRole::Definition as i32) == 0
+        })
+        .collect();
+    assert_eq!(
+        chained_method_refs.len(),
+        2,
+        "Expected 2 references to User#getName(). (regular + null-safe), got {}.\n\
+         ProfileService occurrences: {:?}",
+        chained_method_refs.len(),
+        profile_service_doc
+            .occurrences
+            .iter()
+            .map(|o| &o.symbol)
+            .collect::<Vec<_>>()
+    );
+
+    // Both `$profile->user` (regular) and `$profile?->user` (null-safe) should each
+    // emit a reference to UserProfile#user. — expect 2 total.
+    let user_prop_refs: Vec<_> = profile_service_doc
+        .occurrences
+        .iter()
+        .filter(|o| {
+            o.symbol.contains("App/Models/UserProfile#user.")
+                && (o.symbol_roles & scip::types::SymbolRole::Definition as i32) == 0
+        })
+        .collect();
+    assert_eq!(
+        user_prop_refs.len(),
+        2,
+        "Expected 2 references to UserProfile#user. (regular + null-safe), got {}.\n\
+         ProfileService occurrences: {:?}",
+        user_prop_refs.len(),
+        profile_service_doc
+            .occurrences
+            .iter()
+            .map(|o| &o.symbol)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn test_phpdoc_extraction() {
     let project_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample-project");
 

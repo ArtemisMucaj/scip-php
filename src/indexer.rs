@@ -18,6 +18,23 @@ pub struct Indexer {
     /// Maps variable names (e.g. "$user") to their resolved class FQN (e.g. "App\\Models\\User").
     /// Populated from parameter type hints before walking method/function bodies, cleared after.
     var_types: RefCell<HashMap<String, String>>,
+    /// Maps class FQN → (property name → property type FQN).
+    ///
+    /// Built in a lightweight pre-pass over all project files before the main indexing pass.
+    /// This enables type resolution for chained property accesses:
+    ///
+    ///   `$device->home->advertiseUsersAboutReset(...)` resolves to
+    ///   `Netatmo/Models/Homes/Home#advertiseUsersAboutReset()` because we know
+    ///   `Device::$home` has type `Home`.
+    property_types: RefCell<HashMap<String, HashMap<String, String>>>,
+    /// Maps class FQN → (method name → return type FQN).
+    ///
+    /// Built alongside `property_types` in the pre-pass.  This allows
+    /// `try_resolve_class_from_expr` to propagate types through method calls:
+    ///
+    ///   `self::loadDevice()` is typed as `Device` if `loadDevice()` has a
+    ///   native return type hint or a PHPDoc `@return Device` tag.
+    method_return_types: RefCell<HashMap<String, HashMap<String, String>>>,
 }
 
 impl Indexer {
@@ -25,6 +42,8 @@ impl Indexer {
         Indexer {
             project,
             var_types: RefCell::new(HashMap::new()),
+            property_types: RefCell::new(HashMap::new()),
+            method_return_types: RefCell::new(HashMap::new()),
         }
     }
 
@@ -32,6 +51,21 @@ impl Indexer {
     pub fn index(&self) -> Result<Index> {
         let php_files = self.project.discover_php_files();
         eprintln!("scip-php: found {} PHP files", php_files.len());
+
+        // Pre-pass: build the global property-type map so that chained property accesses
+        // (e.g. `$device->home->method()`) can be resolved during the main indexing pass.
+        for file_path in &php_files {
+            self.collect_property_types_from_file(file_path);
+        }
+        eprintln!(
+            "scip-php: collected property types for {} classes, method return types for {} methods",
+            self.property_types.borrow().len(),
+            self.method_return_types
+                .borrow()
+                .values()
+                .map(|m| m.len())
+                .sum::<usize>(),
+        );
 
         let mut documents = Vec::new();
 
@@ -1605,7 +1639,7 @@ impl Indexer {
         // Walk method body for expression references
         if let mago_syntax::ast::MethodBody::Concrete(ref block) = method.body {
             // Populate variable type map from parameter type hints
-            self.populate_var_types_from_params(&method.parameter_list, resolved_names);
+            self.populate_var_types_from_params(&method.parameter_list, resolved_names, Some(class_fqn));
             self.walk_block_statements(
                 block,
                 trivia,
@@ -1702,7 +1736,7 @@ impl Indexer {
         }
 
         // Walk function body for expression references
-        self.populate_var_types_from_params(&func.parameter_list, resolved_names);
+        self.populate_var_types_from_params(&func.parameter_list, resolved_names, None);
         self.walk_block_statements(
             &func.body,
             trivia,
@@ -2348,20 +2382,24 @@ impl Indexer {
                 }
             }
 
-            // Assignment: walk both sides, and infer variable types from `new ClassName()`
+            // Assignment: walk both sides, and infer variable types from RHS expressions.
+            // Handles `new ClassName()`, `$obj->method()`, `ClassName::method()`,
+            // `$obj->property`, etc., by delegating to try_resolve_class_from_expr.
             Expression::Assignment(assign) => {
-                // If LHS is a simple variable and RHS is `new ClassName(...)`, track the type
+                // If LHS is a simple variable, infer its type from the RHS expression.
                 if let Expression::Variable(mago_syntax::ast::Variable::Direct(dv)) = assign.lhs {
-                    if let Expression::Instantiation(inst) = assign.rhs {
-                        if let Some(class_fqn) = self.try_resolve_class_from_expr(
-                            inst.class,
-                            resolved_names,
-                            enclosing_class_fqn,
-                        ) {
-                            self.var_types
-                                .borrow_mut()
-                                .insert(dv.name.to_string(), class_fqn);
-                        }
+                    if let Some(class_fqn) = self.try_resolve_class_from_expr(
+                        assign.rhs,
+                        resolved_names,
+                        enclosing_class_fqn,
+                    ) {
+                        self.var_types
+                            .borrow_mut()
+                            .insert(dv.name.to_string(), class_fqn);
+                    } else {
+                        self.var_types
+                            .borrow_mut()
+                            .remove(&dv.name.to_string());
                     }
                 }
                 self.walk_expression(
@@ -2782,8 +2820,7 @@ impl Indexer {
         resolved_names: &mago_names::ResolvedNames<'arena>,
         enclosing_class_fqn: Option<&str>,
     ) -> Option<String> {
-        use mago_syntax::ast::Expression;
-        use mago_syntax::ast::Variable;
+        use mago_syntax::ast::{Access, Expression, Variable};
 
         match expr {
             Expression::Variable(Variable::Direct(dv)) if dv.name == "$this" => {
@@ -2793,6 +2830,10 @@ impl Indexer {
                 // Look up variable type from parameter type hints
                 self.var_types.borrow().get(dv.name).cloned()
             }
+            // `self` keyword → refers to the enclosing class
+            Expression::Self_(_) => enclosing_class_fqn.map(|s| s.to_string()),
+            // `static` keyword → late-static binding, treat same as self for resolution
+            Expression::Static(_) => enclosing_class_fqn.map(|s| s.to_string()),
             Expression::Identifier(ident) => {
                 let name = ident.value();
                 match name.to_lowercase().as_str() {
@@ -2806,6 +2847,106 @@ impl Indexer {
                     }
                 }
             }
+            // Chained property access: `$device->home` or `$device?->home`
+            // Resolve the object's type first, then look up the property in the
+            // pre-built property_types map to obtain the property's own type.
+            Expression::Access(Access::Property(prop)) => {
+                if let mago_syntax::ast::ClassLikeMemberSelector::Identifier(prop_ident) =
+                    &prop.property
+                {
+                    let object_class = self.try_resolve_class_from_expr(
+                        prop.object,
+                        resolved_names,
+                        enclosing_class_fqn,
+                    )?;
+                    self.property_types
+                        .borrow()
+                        .get(&object_class)?
+                        .get(prop_ident.value)
+                        .cloned()
+                } else {
+                    None
+                }
+            }
+            Expression::Access(Access::NullSafeProperty(prop)) => {
+                if let mago_syntax::ast::ClassLikeMemberSelector::Identifier(prop_ident) =
+                    &prop.property
+                {
+                    let object_class = self.try_resolve_class_from_expr(
+                        prop.object,
+                        resolved_names,
+                        enclosing_class_fqn,
+                    )?;
+                    self.property_types
+                        .borrow()
+                        .get(&object_class)?
+                        .get(prop_ident.value)
+                        .cloned()
+                } else {
+                    None
+                }
+            }
+            // `new ClassName(...)` → resolve the class reference
+            Expression::Instantiation(inst) => {
+                self.try_resolve_class_from_expr(inst.class, resolved_names, enclosing_class_fqn)
+            }
+            // Method call: `$obj->method(...)` → look up method return type
+            Expression::Call(mago_syntax::ast::Call::Method(mc)) => {
+                if let mago_syntax::ast::ClassLikeMemberSelector::Identifier(method_ident) =
+                    &mc.method
+                {
+                    let object_class = self.try_resolve_class_from_expr(
+                        mc.object,
+                        resolved_names,
+                        enclosing_class_fqn,
+                    )?;
+                    self.method_return_types
+                        .borrow()
+                        .get(&object_class)?
+                        .get(method_ident.value)
+                        .cloned()
+                } else {
+                    None
+                }
+            }
+            // Null-safe method call: `$obj?->method(...)` → same as above
+            Expression::Call(mago_syntax::ast::Call::NullSafeMethod(mc)) => {
+                if let mago_syntax::ast::ClassLikeMemberSelector::Identifier(method_ident) =
+                    &mc.method
+                {
+                    let object_class = self.try_resolve_class_from_expr(
+                        mc.object,
+                        resolved_names,
+                        enclosing_class_fqn,
+                    )?;
+                    self.method_return_types
+                        .borrow()
+                        .get(&object_class)?
+                        .get(method_ident.value)
+                        .cloned()
+                } else {
+                    None
+                }
+            }
+            // Static method call: `ClassName::method(...)` → look up method return type
+            Expression::Call(mago_syntax::ast::Call::StaticMethod(sc)) => {
+                if let mago_syntax::ast::ClassLikeMemberSelector::Identifier(method_ident) =
+                    &sc.method
+                {
+                    let class_fqn = self.try_resolve_class_from_expr(
+                        sc.class,
+                        resolved_names,
+                        enclosing_class_fqn,
+                    )?;
+                    self.method_return_types
+                        .borrow()
+                        .get(&class_fqn)?
+                        .get(method_ident.value)
+                        .cloned()
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
@@ -2817,11 +2958,16 @@ impl Indexer {
         &self,
         hint: &mago_syntax::ast::Hint<'arena>,
         resolved_names: &mago_names::ResolvedNames<'arena>,
+        class_fqn: Option<&str>,
     ) -> Option<String> {
         use mago_syntax::ast::Hint;
         match hint {
             Hint::Identifier(ident) => {
                 let name = ident.value();
+                // Translate fluent return types to the enclosing class FQN.
+                if matches!(name.to_lowercase().as_str(), "self" | "static") {
+                    return class_fqn.map(String::from);
+                }
                 if is_builtin_type(name) {
                     None
                 } else {
@@ -2831,7 +2977,9 @@ impl Indexer {
                     Some(fqn)
                 }
             }
-            Hint::Nullable(nullable) => self.resolve_hint_to_fqn(&nullable.hint, resolved_names),
+            Hint::Nullable(nullable) => {
+                self.resolve_hint_to_fqn(&nullable.hint, resolved_names, class_fqn)
+            }
             // Union/intersection types are ambiguous — don't resolve
             _ => None,
         }
@@ -2842,15 +2990,400 @@ impl Indexer {
         &self,
         params: &mago_syntax::ast::FunctionLikeParameterList<'arena>,
         resolved_names: &mago_names::ResolvedNames<'arena>,
+        class_fqn: Option<&str>,
     ) {
         let mut var_types = self.var_types.borrow_mut();
         for param in params.parameters.iter() {
             if let Some(hint) = &param.hint {
-                if let Some(fqn) = self.resolve_hint_to_fqn(hint, resolved_names) {
+                if let Some(fqn) = self.resolve_hint_to_fqn(hint, resolved_names, class_fqn) {
                     var_types.insert(param.variable.name.to_string(), fqn);
                 }
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Property-type pre-pass
+    // -----------------------------------------------------------------------
+
+    /// Lightweight pre-pass over a single PHP file: collect class property type
+    /// hints and method return types into `self.property_types` /
+    /// `self.method_return_types`.  Parse errors are silently skipped.
+    fn collect_property_types_from_file(&self, file_path: &std::path::Path) {
+        let source = match std::fs::read_to_string(file_path) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        let arena = bumpalo::Bump::new();
+        let relative_path = self.project.relative_path(file_path);
+        let file =
+            mago_database::file::File::ephemeral(relative_path.into(), source.clone().into());
+        let program = mago_syntax::parser::parse_file(&arena, &file);
+
+        let resolver = mago_names::resolver::NameResolver::new(&arena);
+        let resolved_names = resolver.resolve(program);
+
+        // Build a simple use-alias map for PHPDoc type resolution.
+        // Maps last-segment (or alias) → fully-qualified name.
+        let use_map = self.build_use_map_from_statements(&program.statements);
+
+        self.collect_property_types_from_statements(
+            &program.statements,
+            &program.trivia,
+            program.source_text,
+            &resolved_names,
+            &use_map,
+        );
+    }
+
+    /// Walk use-statement items and build a map from the last name segment (or
+    /// explicit alias) to the fully-qualified class name.
+    ///
+    /// This is used to resolve simple type names found in PHPDoc `@return` tags,
+    /// e.g. `Device` → `Netatmo\Models\Devices\Device`.
+    fn build_use_map_from_statements<'arena>(
+        &self,
+        statements: &mago_syntax::ast::Sequence<'arena, mago_syntax::ast::Statement<'arena>>,
+    ) -> HashMap<String, String> {
+        use mago_syntax::ast::{NamespaceBody, Statement, UseItems};
+
+        let mut map = HashMap::new();
+
+        for stmt in statements.iter() {
+            match stmt {
+                Statement::Namespace(ns) => {
+                    let inner = match &ns.body {
+                        NamespaceBody::Implicit(body) => &body.statements,
+                        NamespaceBody::BraceDelimited(block) => &block.statements,
+                    };
+                    let inner_map = self.build_use_map_from_statements(inner);
+                    map.extend(inner_map);
+                }
+                Statement::Use(use_stmt) => {
+                    let items: Vec<_> = match &use_stmt.items {
+                        UseItems::Sequence(seq) => seq.items.iter().collect(),
+                        UseItems::TypedSequence(seq) => seq.items.iter().collect(),
+                        UseItems::TypedList(list) => list.items.iter().collect(),
+                        UseItems::MixedList(_) => vec![],
+                    };
+                    for item in items {
+                        let fqn = item.name.value();
+                        let alias = item
+                            .alias
+                            .as_ref()
+                            .map(|a| a.identifier.value.to_string())
+                            .unwrap_or_else(|| item.name.last_segment().to_string());
+                        map.insert(alias, fqn.trim_start_matches('\\').replace('\\', "\\"));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        map
+    }
+
+    /// Walk statements looking for class/trait definitions and extract their
+    /// typed property declarations and method return types.
+    fn collect_property_types_from_statements<'arena>(
+        &self,
+        statements: &mago_syntax::ast::Sequence<'arena, mago_syntax::ast::Statement<'arena>>,
+        trivia: &mago_syntax::ast::Sequence<'arena, mago_syntax::ast::Trivia<'arena>>,
+        source: &str,
+        resolved_names: &mago_names::ResolvedNames<'arena>,
+        use_map: &HashMap<String, String>,
+    ) {
+        use mago_syntax::ast::{NamespaceBody, Statement};
+
+        for stmt in statements.iter() {
+            match stmt {
+                Statement::Namespace(ns) => match &ns.body {
+                    NamespaceBody::Implicit(body) => {
+                        // Build a namespace-scoped use map so aliases from one namespace
+                        // do not leak into another.
+                        let ns_use_map =
+                            self.build_use_map_from_statements(&body.statements);
+                        self.collect_property_types_from_statements(
+                            &body.statements,
+                            trivia,
+                            source,
+                            resolved_names,
+                            &ns_use_map,
+                        );
+                    }
+                    NamespaceBody::BraceDelimited(block) => {
+                        let ns_use_map =
+                            self.build_use_map_from_statements(&block.statements);
+                        self.collect_property_types_from_statements(
+                            &block.statements,
+                            trivia,
+                            source,
+                            resolved_names,
+                            &ns_use_map,
+                        );
+                    }
+                },
+                Statement::Class(class) => {
+                    let class_fqn = self
+                        .resolve_name(&class.name, resolved_names)
+                        .unwrap_or_else(|| class.name.value.to_string());
+                    self.collect_property_types_from_class_members(
+                        &class_fqn,
+                        class.members.iter(),
+                        trivia,
+                        source,
+                        resolved_names,
+                        use_map,
+                    );
+                }
+                Statement::Trait(trait_def) => {
+                    // Traits may also declare typed properties.
+                    let trait_fqn = self
+                        .resolve_name(&trait_def.name, resolved_names)
+                        .unwrap_or_else(|| trait_def.name.value.to_string());
+                    self.collect_property_types_from_class_members(
+                        &trait_fqn,
+                        trait_def.members.iter(),
+                        trivia,
+                        source,
+                        resolved_names,
+                        use_map,
+                    );
+                }
+                Statement::Interface(iface) => {
+                    let iface_fqn = self
+                        .resolve_name(&iface.name, resolved_names)
+                        .unwrap_or_else(|| iface.name.value.to_string());
+                    self.collect_property_types_from_class_members(
+                        &iface_fqn,
+                        iface.members.iter(),
+                        trivia,
+                        source,
+                        resolved_names,
+                        use_map,
+                    );
+                }
+                Statement::Enum(enum_def) => {
+                    let enum_fqn = self
+                        .resolve_name(&enum_def.name, resolved_names)
+                        .unwrap_or_else(|| enum_def.name.value.to_string());
+                    self.collect_property_types_from_class_members(
+                        &enum_fqn,
+                        enum_def.members.iter(),
+                        trivia,
+                        source,
+                        resolved_names,
+                        use_map,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Resolve a PHPDoc type-name string to a fully-qualified class name.
+    ///
+    /// Handles:
+    /// - `\App\Models\User` (FQN with leading backslash) → strip `\`
+    /// - `User` (simple name) → look up in `use_map`
+    /// - built-in types → `None`
+    fn resolve_phpdoc_type(
+        &self,
+        type_name: &str,
+        use_map: &HashMap<String, String>,
+        namespace: Option<&str>,
+    ) -> Option<String> {
+        // Strip leading backslash for FQNs
+        let name = type_name.trim_start_matches('\\');
+
+        // Reject built-in / scalar types
+        let first_segment = name.split('\\').next().unwrap_or(name);
+        if is_builtin_type(first_segment) {
+            return None;
+        }
+
+        // Always try to resolve the FIRST segment against the use map, regardless
+        // of whether the name is simple (`Device`) or qualified (`Devices\Device`).
+        //
+        // Example: `@return Devices\Device` in a file with `use Netatmo\Models\Devices`
+        //   first_segment = "Devices"
+        //   use_map["Devices"] = "Netatmo\Models\Devices"
+        //   remaining     = "\Device"
+        //   result        = "Netatmo\Models\Devices\Device"
+        if let Some(fqn_prefix) = use_map.get(first_segment) {
+            let remaining = &name[first_segment.len()..]; // starts with `\` when qualified
+            if remaining.is_empty() {
+                Some(fqn_prefix.clone())
+            } else {
+                Some(format!(
+                    "{}\\{}",
+                    fqn_prefix,
+                    remaining.trim_start_matches('\\')
+                ))
+            }
+        } else if name.contains('\\') {
+            // Qualified but first segment not in use map — return as-is (already an FQN
+            // relative to the current namespace; may not be perfect but is a best-effort).
+            Some(name.to_string())
+        } else {
+            // Simple unqualified name not in use map — qualify with namespace if available.
+            if let Some(ns) = namespace {
+                Some(format!("{}\\{}", ns, name))
+            } else {
+                Some(name.to_string())
+            }
+        }
+    }
+
+    /// Extract typed property declarations and method return types from a class-like
+    /// body and store them in `self.property_types` / `self.method_return_types`.
+    fn collect_property_types_from_class_members<'arena, I>(
+        &self,
+        class_fqn: &str,
+        members: I,
+        trivia: &mago_syntax::ast::Sequence<'arena, mago_syntax::ast::Trivia<'arena>>,
+        source: &str,
+        resolved_names: &mago_names::ResolvedNames<'arena>,
+        use_map: &HashMap<String, String>,
+    ) where
+        I: Iterator<Item = &'arena mago_syntax::ast::ClassLikeMember<'arena>>,
+    {
+        use mago_span::HasSpan;
+        use mago_syntax::ast::ClassLikeMember;
+
+        for member in members {
+            match member {
+                ClassLikeMember::Property(prop) => {
+                    if let Some(hint) = prop.hint() {
+                        if let Some(type_fqn) = self.resolve_hint_to_fqn(hint, resolved_names, Some(class_fqn)) {
+                            for var in prop.variables() {
+                                let prop_name =
+                                    var.name.strip_prefix('$').unwrap_or(var.name).to_string();
+                                self.property_types
+                                    .borrow_mut()
+                                    .entry(class_fqn.to_string())
+                                    .or_default()
+                                    .insert(prop_name, type_fqn.clone());
+                            }
+                        }
+                    }
+                }
+                ClassLikeMember::Method(method) => {
+                    let method_name = method.name.value.to_string();
+
+                    // 1. Try native PHP return type hint first (most reliable).
+                    let return_fqn = method
+                        .return_type_hint
+                        .as_ref()
+                        .and_then(|rt| self.resolve_hint_to_fqn(&rt.hint, resolved_names, Some(class_fqn)))
+                        // 2. Fall back to PHPDoc `@return` tag.
+                        .or_else(|| {
+                            self.extract_phpdoc_return_type(
+                                trivia,
+                                method.span().start.offset,
+                                source,
+                                use_map,
+                                Some(class_fqn),
+                            )
+                        });
+
+                    if let Some(type_fqn) = return_fqn {
+                        self.method_return_types
+                            .borrow_mut()
+                            .entry(class_fqn.to_string())
+                            .or_default()
+                            .insert(method_name, type_fqn);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Extract the return type from the PHPDoc block immediately preceding the
+    /// definition at `def_offset`.  Returns `None` if no `@return` tag is found
+    /// or if the type cannot be resolved to a class.
+    fn extract_phpdoc_return_type<'arena>(
+        &self,
+        trivia: &mago_syntax::ast::Sequence<'arena, mago_syntax::ast::Trivia<'arena>>,
+        def_offset: u32,
+        source: &str,
+        use_map: &HashMap<String, String>,
+        class_fqn: Option<&str>,
+    ) -> Option<String> {
+        use mago_syntax::ast::TriviaKind;
+
+        // Find the closest docblock that ends before def_offset.
+        let mut best: Option<&mago_syntax::ast::Trivia<'arena>> = None;
+        for t in trivia.iter() {
+            if t.kind != TriviaKind::DocBlockComment {
+                continue;
+            }
+            if t.span.end.offset <= def_offset {
+                match best {
+                    Some(prev) if t.span.end.offset > prev.span.end.offset => {
+                        best = Some(t);
+                    }
+                    None => {
+                        best = Some(t);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let docblock_trivia = best?;
+
+        // Ensure the docblock is directly attached (no intervening statements).
+        let docblock_end = docblock_trivia.span.end.offset;
+        let between = &source[docblock_end as usize..def_offset as usize];
+        if between.contains('{') || between.contains('}') || between.contains(';') {
+            return None;
+        }
+
+        let arena = bumpalo::Bump::new();
+        let doc = mago_docblock::parse_trivia(&arena, docblock_trivia).ok()?;
+
+        // Find the first `@return` tag and extract its type name.
+        for element in doc.elements.iter() {
+            if let mago_docblock::document::Element::Tag(tag) = element {
+                if tag.name.eq_ignore_ascii_case("return") {
+                    // The description starts with the type, possibly followed by a
+                    // variable name or further description: `@return Device $device desc`
+                    let raw_type = tag
+                        .description
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("");
+
+                    // Split union types on '|', strip leading/trailing '?', skip "null".
+                    let type_name: Option<&str> = raw_type
+                        .split('|')
+                        .map(|s| s.trim().trim_matches('?'))
+                        .find(|s| !s.is_empty() && !s.eq_ignore_ascii_case("null"))
+                        .or_else(|| {
+                            // Fallback: use first member even if it's null-like.
+                            raw_type
+                                .split('|')
+                                .next()
+                                .map(|s| s.trim().trim_matches('?'))
+                                .filter(|s| !s.is_empty())
+                        });
+
+                    if let Some(type_name) = type_name {
+                        if matches!(type_name.to_lowercase().as_str(), "self" | "static") {
+                            return class_fqn.map(String::from);
+                        }
+                        let namespace = class_fqn
+                            .and_then(|fqn| fqn.rfind('\\').map(|i| &fqn[..i]));
+                        return self.resolve_phpdoc_type(type_name, use_map, namespace);
+                    }
+                }
+            }
+        }
+
+        None
     }
 }
 
@@ -2871,8 +3404,6 @@ fn is_builtin_type(name: &str) -> bool {
             | "mixed"
             | "callable"
             | "iterable"
-            | "self"
-            | "static"
             | "parent"
             | "true"
             | "false"
