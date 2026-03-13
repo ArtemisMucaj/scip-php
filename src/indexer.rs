@@ -10,6 +10,7 @@ use scip::types::{
 
 use crate::line_index::LineIndex;
 use crate::project::PhpProject;
+use crate::signature::{hint_to_string, modifiers_to_string, params_to_string, with_signature};
 use crate::symbol::{format_symbol, SymbolBuilder};
 
 /// SCIP indexer for PHP projects.
@@ -1195,7 +1196,26 @@ impl Indexer {
             }
         }
 
-        let documentation = self.extract_documentation(trivia, class.span().start.offset, source);
+        let phpdoc = self.extract_documentation(trivia, class.span().start.offset, source);
+        let mut sig = modifiers_to_string(class.modifiers.iter());
+        if !sig.is_empty() {
+            sig.push(' ');
+        }
+        sig.push_str("class ");
+        sig.push_str(&class_name);
+        if let Some(extends) = &class.extends {
+            let parents: Vec<String> =
+                extends.types.iter().map(|p| p.value().to_string()).collect();
+            sig.push_str(" extends ");
+            sig.push_str(&parents.join(", "));
+        }
+        if let Some(implements) = &class.implements {
+            let ifaces: Vec<String> =
+                implements.types.iter().map(|i| i.value().to_string()).collect();
+            sig.push_str(" implements ");
+            sig.push_str(&ifaces.join(", "));
+        }
+        let documentation = with_signature(sig, phpdoc);
         symbols.push(SymbolInformation {
             symbol: class_symbol_str,
             kind: types::symbol_information::Kind::Class.into(),
@@ -1272,7 +1292,15 @@ impl Indexer {
             }
         }
 
-        let documentation = self.extract_documentation(trivia, iface.span().start.offset, source);
+        let phpdoc = self.extract_documentation(trivia, iface.span().start.offset, source);
+        let mut sig = format!("interface {}", iface_name);
+        if let Some(extends) = &iface.extends {
+            let parents: Vec<String> =
+                extends.types.iter().map(|p| p.value().to_string()).collect();
+            sig.push_str(" extends ");
+            sig.push_str(&parents.join(", "));
+        }
+        let documentation = with_signature(sig, phpdoc);
         symbols.push(SymbolInformation {
             symbol: iface_symbol_str,
             kind: types::symbol_information::Kind::Interface.into(),
@@ -1327,8 +1355,9 @@ impl Indexer {
             ..Default::default()
         });
 
-        let documentation =
-            self.extract_documentation(trivia, trait_def.span().start.offset, source);
+        let phpdoc = self.extract_documentation(trivia, trait_def.span().start.offset, source);
+        let sig = format!("trait {}", trait_name);
+        let documentation = with_signature(sig, phpdoc);
         symbols.push(SymbolInformation {
             symbol: trait_symbol_str,
             kind: types::symbol_information::Kind::Trait.into(),
@@ -1403,8 +1432,19 @@ impl Indexer {
             }
         }
 
-        let documentation =
-            self.extract_documentation(trivia, enum_def.span().start.offset, source);
+        let phpdoc = self.extract_documentation(trivia, enum_def.span().start.offset, source);
+        let mut sig = format!("enum {}", enum_name);
+        if let Some(backing) = &enum_def.backing_type_hint {
+            sig.push_str(": ");
+            sig.push_str(&hint_to_string(&backing.hint));
+        }
+        if let Some(implements) = &enum_def.implements {
+            let ifaces: Vec<String> =
+                implements.types.iter().map(|i| i.value().to_string()).collect();
+            sig.push_str(" implements ");
+            sig.push_str(&ifaces.join(", "));
+        }
+        let documentation = with_signature(sig, phpdoc);
         symbols.push(SymbolInformation {
             symbol: enum_symbol_str,
             kind: types::symbol_information::Kind::Enum.into(),
@@ -1542,7 +1582,20 @@ impl Indexer {
             ..Default::default()
         });
 
-        let documentation = self.extract_documentation(trivia, case.span().start.offset, source);
+        let phpdoc = self.extract_documentation(trivia, case.span().start.offset, source);
+        // Include backed value in signature if present (extract from source span)
+        let sig = match &case.item {
+            mago_syntax::ast::EnumCaseItem::Unit(u) => {
+                format!("case {}", u.name.value)
+            }
+            mago_syntax::ast::EnumCaseItem::Backed(b) => {
+                let val_start = b.value.span().start.offset as usize;
+                let val_end = b.value.span().end.offset as usize;
+                let val_src = source.get(val_start..val_end).unwrap_or("?");
+                format!("case {} = {}", b.name.value, val_src)
+            }
+        };
+        let documentation = with_signature(sig, phpdoc);
         symbols.push(SymbolInformation {
             symbol: case_symbol_str,
             kind: types::symbol_information::Kind::EnumMember.into(),
@@ -1584,7 +1637,22 @@ impl Indexer {
             types::symbol_information::Kind::Method
         };
 
-        let documentation = self.extract_documentation(trivia, method.span().start.offset, source);
+        let phpdoc = self.extract_documentation(trivia, method.span().start.offset, source);
+        let mut sig = modifiers_to_string(method.modifiers.iter());
+        if !sig.is_empty() {
+            sig.push(' ');
+        }
+        sig.push_str("function ");
+        if method.ampersand.is_some() {
+            sig.push('&');
+        }
+        sig.push_str(&method_name);
+        sig.push_str(&params_to_string(&method.parameter_list));
+        if let Some(ret) = &method.return_type_hint {
+            sig.push_str(": ");
+            sig.push_str(&hint_to_string(&ret.hint));
+        }
+        let documentation = with_signature(sig, phpdoc);
         symbols.push(SymbolInformation {
             symbol: method_symbol_str,
             kind: kind.into(),
@@ -1685,7 +1753,18 @@ impl Indexer {
             ..Default::default()
         });
 
-        let documentation = self.extract_documentation(trivia, func.span().start.offset, source);
+        let phpdoc = self.extract_documentation(trivia, func.span().start.offset, source);
+        let mut sig = String::from("function ");
+        if func.ampersand.is_some() {
+            sig.push('&');
+        }
+        sig.push_str(&func_name);
+        sig.push_str(&params_to_string(&func.parameter_list));
+        if let Some(ret) = &func.return_type_hint {
+            sig.push_str(": ");
+            sig.push_str(&hint_to_string(&ret.hint));
+        }
+        let documentation = with_signature(sig, phpdoc);
         symbols.push(SymbolInformation {
             symbol: func_symbol_str,
             kind: types::symbol_information::Kind::Function.into(),
@@ -1784,8 +1863,17 @@ impl Indexer {
                 ..Default::default()
             });
 
-            let documentation =
-                self.extract_documentation(trivia, prop.span().start.offset, source);
+            let phpdoc = self.extract_documentation(trivia, prop.span().start.offset, source);
+            let mut sig = modifiers_to_string(prop.modifiers().iter());
+            if !sig.is_empty() {
+                sig.push(' ');
+            }
+            if let Some(hint) = prop.hint() {
+                sig.push_str(&hint_to_string(hint));
+                sig.push(' ');
+            }
+            sig.push_str(var.name); // includes the `$`
+            let documentation = with_signature(sig, phpdoc);
             symbols.push(SymbolInformation {
                 symbol: prop_symbol_str,
                 kind: types::symbol_information::Kind::Property.into(),
@@ -1821,8 +1909,18 @@ impl Indexer {
                 ..Default::default()
             });
 
-            let documentation =
-                self.extract_documentation(trivia, constant.span().start.offset, source);
+            let phpdoc = self.extract_documentation(trivia, constant.span().start.offset, source);
+            let mut sig = modifiers_to_string(constant.modifiers.iter());
+            if !sig.is_empty() {
+                sig.push(' ');
+            }
+            sig.push_str("const ");
+            if let Some(hint) = &constant.hint {
+                sig.push_str(&hint_to_string(hint));
+                sig.push(' ');
+            }
+            sig.push_str(&const_name);
+            let documentation = with_signature(sig, phpdoc);
             symbols.push(SymbolInformation {
                 symbol: const_symbol_str,
                 kind: types::symbol_information::Kind::Constant.into(),
@@ -1862,8 +1960,9 @@ impl Indexer {
                 ..Default::default()
             });
 
-            let documentation =
-                self.extract_documentation(trivia, constant.span().start.offset, source);
+            let phpdoc = self.extract_documentation(trivia, constant.span().start.offset, source);
+            let sig = format!("const {}", const_name);
+            let documentation = with_signature(sig, phpdoc);
             symbols.push(SymbolInformation {
                 symbol: const_symbol_str,
                 kind: types::symbol_information::Kind::Constant.into(),
