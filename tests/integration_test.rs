@@ -451,16 +451,27 @@ fn test_phpdoc_extraction() {
         get_name_sym.documentation
     );
 
-    // setName has no PHPDoc, so its documentation should be empty
+    // setName has no PHPDoc, so its documentation should contain only the signature block
     let set_name_sym = user_doc
         .symbols
         .iter()
         .find(|s| s.symbol.contains("setName()."))
         .expect("Should have setName SymbolInformation");
 
+    assert_eq!(
+        set_name_sym.documentation.len(),
+        1,
+        "setName should have only the signature block (no PHPDoc), got: {:?}",
+        set_name_sym.documentation
+    );
     assert!(
-        set_name_sym.documentation.is_empty(),
-        "setName should have no documentation (no PHPDoc), got: {:?}",
+        set_name_sym.documentation[0].contains("```php"),
+        "setName documentation should be a signature code block, got: {:?}",
+        set_name_sym.documentation
+    );
+    assert!(
+        set_name_sym.documentation[0].contains("setName"),
+        "setName signature should contain the method name, got: {:?}",
         set_name_sym.documentation
     );
 }
