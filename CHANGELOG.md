@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/ArtemisMucaj/scip-php/compare/v0.2.1...v0.3.0) (2026-03-13)
+
+
+### Features
+
+* emit php code signatures in scip file ([#11](https://github.com/ArtemisMucaj/scip-php/issues/11)) ([e79fb7b](https://github.com/ArtemisMucaj/scip-php/commit/e79fb7b3ec29efe4a6f76896e550c5354419b238))
+
 ## [0.2.1](https://github.com/ArtemisMucaj/scip-php/compare/v0.2.0...v0.2.1) (2026-03-10)
 
 
